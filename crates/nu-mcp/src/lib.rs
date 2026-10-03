@@ -21,6 +21,7 @@ use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
+mod elicitation;
 mod evaluation;
 mod history;
 mod server;

@@ -254,6 +254,22 @@ Gotchas: there is no `job ls` (use `job list`). `job recv` reads only the
 current job's mailbox and takes no id. `job send` always takes a target id;
 the main thread is `0`.
 
+## Asking the user — `elicit`
+
+Inside `evaluate`, the builtin `elicit` prompts the end user through the MCP
+client and returns their answer as a record. Use it before irreversible or
+ambiguous actions instead of guessing:
+
+```nu
+let answer = elicit "Delete the production bucket?" --schema {confirmed: bool}
+# answer == {confirmed: true} when accepted; decline/cancel abort the pipeline
+```
+
+See the `evaluate` tool description for how the `input_required` round-trip
+works (`inputResponses` + `requestState`). Requires a client on MCP protocol
+`2026-07-28` or newer. There is no timeout on the user — the pipeline waits
+indefinitely for the answer; only session end or a superseding round aborts it.
+
 ## Other quick tips
 
 - Use `detect columns` to structure columnar CLI output (e.g.

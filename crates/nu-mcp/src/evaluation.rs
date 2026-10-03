@@ -1,13 +1,23 @@
+use crate::elicitation::{ElicitBridge, PendingElicit, with_active_bridge};
 use crate::history::History;
+use futures::StreamExt;
 use miette::{Diagnostic, SourceCode, SourceSpan};
 use nu_protocol::{
     FromValue, PipelineData, PipelineExecutionData, Signals, Span, Value,
     debugger::WithoutDebug,
     engine::{EngineState, Job, Jobs, Mail, Stack, StateWorkingSet, ThreadJob},
 };
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::{
+    RoleServer,
+    model::{
+        CallToolResponse, CallToolResult, ContentBlock, ElicitResult, InputRequest, InputRequests,
+        InputRequiredResult, InputResponses, ProtocolVersion,
+    },
+    service::RequestContext,
+};
 use serde_json::{Value as JsonValue, json};
 use std::{
+    collections::HashMap,
     fmt::Write,
     sync::{Arc, Mutex as SyncMutex, atomic::AtomicBool, mpsc, mpsc::Sender},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -225,6 +235,65 @@ const DEFAULT_PROMOTE_AFTER: Duration = Duration::from_secs(120);
 /// Large outputs are truncated in the response but stored in full in history.
 pub struct Evaluator {
     state: Mutex<EvalState>,
+    /// Live evaluations parked between MRTR elicitation rounds, keyed by the
+    /// opaque `requestState` token handed to the client.
+    pending: SyncMutex<HashMap<String, ParkedEval>>,
+}
+
+/// A live evaluation that has returned an `InputRequiredResult` and is waiting
+/// for the client to retry `tools/call` with `inputResponses`.
+///
+/// The Nushell interpreter thread stays blocked inside the `elicit` command on
+/// `pending_answer`'s channel while the MCP round is over; delivering the
+/// answer resumes the pipeline as if nothing happened.
+struct ParkedEval {
+    /// Opaque `requestState` handle; `None` when elicitation is unavailable
+    /// for this evaluation (legacy client or disabled test path).
+    token: Option<String>,
+    result_rx: oneshot::Receiver<(EvalState, Result<EvalOutput, rmcp::ErrorData>)>,
+    request_rx: futures::channel::mpsc::UnboundedReceiver<PendingElicit>,
+    requests_open: bool,
+    /// The elicitation request the handler parked on, with the channel its
+    /// answer is delivered on. At most one elicitation can be outstanding per
+    /// evaluation because the pipeline blocks on a single thread.
+    pending_answer: Option<(String, mpsc::Sender<ElicitResult>)>,
+    /// Mirrors the flag the `elicit` builtin sets while waiting on the user.
+    parked: Arc<AtomicBool>,
+    interrupt: Arc<AtomicBool>,
+    jobs: Arc<SyncMutex<Jobs>>,
+    root_job_sender: Sender<Mail>,
+    description: String,
+    promote_after: Duration,
+}
+
+/// Elicitation capability of the client for a fresh evaluation round.
+enum BridgeMode {
+    /// No bridge at all: `elicit` fails with "outside an MCP evaluation".
+    /// Used by the synchronous test path.
+    #[cfg(test)]
+    Disabled,
+    /// The client negotiated a pre-`2026-07-28` protocol without MRTR
+    /// support; `elicit` fails with a clear version error.
+    Legacy { version: String },
+    /// MRTR elicitation is available; `elicit` can park the evaluation.
+    MrtrCapable,
+}
+
+/// What the evaluation thread sends back when it finishes: the (possibly
+/// modified) forked state plus the tool result, or a panic marker.
+type EvalDone = Result<(EvalState, Result<EvalOutput, rmcp::ErrorData>), oneshot::error::RecvError>;
+
+/// Outcomes the async round driver waits on while an evaluation runs.
+enum RoundEvent {
+    /// The evaluation thread finished (`Err` variant = task panicked).
+    Done(Box<EvalDone>),
+    /// A parked `elicit` builtin surfaced an elicitation request.
+    Elicit(Box<PendingElicit>),
+    /// The current MCP request was cancelled.
+    Cancelled,
+    /// The promote-after timer fired while the evaluation was actually
+    /// computing (never while parked on a human).
+    Promote,
 }
 
 /// The mutable evaluation state that persists across evaluations.
@@ -274,6 +343,8 @@ impl Evaluator {
         config.use_ansi_coloring = nu_protocol::UseAnsiColoring::False;
         engine_state.set_config(config);
 
+        register_elicit_command(&mut engine_state);
+
         let history = History::new(&mut engine_state);
 
         Self {
@@ -284,69 +355,295 @@ impl Evaluator {
                 stack: Stack::new().capture_all(),
                 history,
             }),
+            pending: SyncMutex::new(HashMap::new()),
         }
     }
 
-    /// Evaluates Nushell source for the MCP tool.
+    /// Evaluates Nushell source for the MCP `evaluate` tool, driving the MRTR
+    /// elicitation flow from the `2026-07-28` spec revision.
     ///
-    /// Runs on a forked state and promotes to a background job if the request is
-    /// cancelled or exceeds the promote-after timeout.
-    ///
-    /// The returned tool result keeps the human-readable NUON text in `content`
-    /// and mirrors the same response as JSON `structuredContent` for MCP clients.
-    pub async fn eval_async(&self, nu_source: &str, ct: CancellationToken) -> CallToolResult {
-        match self.eval_async_output(nu_source, ct).await {
-            Ok(output) => output.into_call_tool_result(),
-            Err(err) => error_call_tool_result(err),
-        }
-    }
-
-    async fn eval_async_output(
+    /// Fresh calls (`request_state == None`) start a new evaluation. When the
+    /// pipeline reaches the `elicit` builtin the evaluation thread parks and
+    /// this returns [`CallToolResponse::InputRequired`] carrying the
+    /// `elicitation/create` request plus an opaque `requestState` token. The
+    /// client then retries `evaluate` with `input_responses` and that token,
+    /// which resumes the parked pipeline via [`Evaluator::resume_round`].
+    pub(crate) async fn eval_tool(
         &self,
         nu_source: &str,
-        ct: CancellationToken,
-    ) -> Result<EvalOutput, rmcp::ErrorData> {
+        ctx: RequestContext<RoleServer>,
+        request_state: Option<String>,
+        input_responses: Option<InputResponses>,
+    ) -> CallToolResponse {
+        if let Some(token) = request_state {
+            return self
+                .resume_round(ctx, token, input_responses.unwrap_or_default())
+                .await;
+        }
+        if input_responses.is_some() {
+            tracing::warn!(
+                "evaluate tool received inputResponses without a requestState; ignoring"
+            );
+        }
+
+        let bridge_mode = match ctx.protocol_version() {
+            Some(version) if version.as_str() < ProtocolVersion::V_2026_07_28.as_str() => {
+                BridgeMode::Legacy {
+                    version: version.as_str().to_string(),
+                }
+            }
+            // Unknown version: the SDK itself refuses InputRequiredResult to
+            // pre-2026 peers, so allow MRTR and let it gate.
+            _ => BridgeMode::MrtrCapable,
+        };
+
+        let parked = self.start_fresh(nu_source, bridge_mode).await;
+        self.drive_round(parked, &ctx.ct).await
+    }
+
+    /// Evaluates Nushell source without elicitation support.
+    ///
+    /// Test-only companion of [`Evaluator::eval_tool`]; `elicit` calls fail
+    /// with a clear error since no MCP round is attached.
+    #[cfg(test)]
+    pub async fn eval_async(&self, nu_source: &str, ct: CancellationToken) -> CallToolResult {
+        let parked = self.start_fresh(nu_source, BridgeMode::Disabled).await;
+        match self.drive_round(parked, &ct).await {
+            CallToolResponse::Complete(result) => result,
+            _ => error_call_tool_result(rmcp::ErrorData::internal_error(
+                "evaluation without elicitation support unexpectedly requested input".to_string(),
+                None,
+            )),
+        }
+    }
+
+    /// Forks the persistent state, installs the elicitation bridge for the
+    /// evaluation thread, and returns the parked session to drive.
+    async fn start_fresh(&self, nu_source: &str, mode: BridgeMode) -> ParkedEval {
         let (forked_state, interrupt, promote_after) = {
             let state = self.state.lock().await;
-            let timeout = promote_timeout(&state.engine_state, &state.stack);
+            let promote = promote_timeout(&state.engine_state, &state.stack);
             let (forked, interrupt) = state.fork();
-            (forked, interrupt, timeout)
+            (forked, interrupt, promote)
         };
 
         let jobs = forked_state.engine_state.jobs.clone();
         let root_job_sender = forked_state.engine_state.root_job_sender.clone();
+        let parked = Arc::new(AtomicBool::new(false));
+        let (request_tx, request_rx) = futures::channel::mpsc::unbounded::<PendingElicit>();
+
+        let (bridge, token) = match mode {
+            BridgeMode::MrtrCapable => {
+                let token = uuid::Uuid::new_v4().to_string();
+                (
+                    Some(ElicitBridge::Mrtr {
+                        request_tx,
+                        parked: parked.clone(),
+                    }),
+                    Some(token),
+                )
+            }
+            BridgeMode::Legacy { version } => {
+                drop(request_tx);
+                (Some(ElicitBridge::Unsupported { version }), None)
+            }
+            #[cfg(test)]
+            BridgeMode::Disabled => {
+                drop(request_tx);
+                (None, None)
+            }
+        };
 
         let source = nu_source.to_string();
         let description = job_description(&source);
-
-        let (result_tx, mut result_rx) = oneshot::channel();
+        let (result_tx, result_rx) = oneshot::channel();
 
         tokio::task::spawn_blocking(move || {
-            if result_tx.send(eval_inner(forked_state, &source)).is_err() {
+            let outcome = with_active_bridge(bridge, move || eval_inner(forked_state, &source));
+            if result_tx.send(outcome).is_err() {
                 tracing::debug!("evaluation result receiver dropped before completion");
             }
         });
 
-        tokio::select! {
-            biased;
-            _ = ct.cancelled() => {
-                promote_to_background_job(result_rx, interrupt, jobs, root_job_sender, description)
+        ParkedEval {
+            token,
+            result_rx,
+            request_rx,
+            requests_open: true,
+            pending_answer: None,
+            parked,
+            interrupt,
+            jobs,
+            root_job_sender,
+            description,
+            promote_after,
+        }
+    }
+
+    /// Delivers the client's answers for a parked elicitation and resumes the
+    /// evaluation, waiting for either the final result or the next round.
+    async fn resume_round(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        token: String,
+        input_responses: InputResponses,
+    ) -> CallToolResponse {
+        let mut parked = {
+            let mut pending = lock_pending(&self.pending);
+            match pending.remove(&token) {
+                Some(parked) => parked,
+                None => return unknown_request_state_error(&token),
             }
-            result = &mut result_rx => match result {
-                Ok((new_state, eval_result)) => {
-                    let mut state = self.state.lock().await;
-                    *state = new_state;
-                    eval_result
+        };
+
+        let mut consumed_id: Option<String> = None;
+        if let Some((id, answer_tx)) = parked.pending_answer.take() {
+            match input_responses.get(&id) {
+                Some(response) => match serde_json::from_value::<ElicitResult>(response.clone()) {
+                    Ok(result) => {
+                        if answer_tx.send(result).is_err() {
+                            tracing::warn!(
+                                "elicitation answer for '{id}' arrived after the evaluation stopped waiting for it"
+                            );
+                        }
+                        consumed_id = Some(id);
+                    }
+                    Err(err) => {
+                        // The builtin is still parked; keep the session alive
+                        // so the client can retry with a well-formed answer.
+                        parked.pending_answer = Some((id.clone(), answer_tx));
+                        self.park(token, parked);
+                        return CallToolResponse::Complete(error_call_tool_result(
+                            rmcp::ErrorData::invalid_params(
+                                format!(
+                                    "could not deserialize inputResponses for elicitation '{id}': {err}"
+                                ),
+                                None,
+                            ),
+                        ));
+                    }
+                },
+                None => {
+                    parked.pending_answer = Some((id.clone(), answer_tx));
+                    self.park(token, parked);
+                    return CallToolResponse::Complete(error_call_tool_result(
+                        rmcp::ErrorData::invalid_params(
+                            format!(
+                                "retry is missing an inputResponses entry for the pending elicitation '{id}'"
+                            ),
+                            None,
+                        ),
+                    ));
                 }
-                Err(_) => Err(rmcp::ErrorData::internal_error(
-                    "Evaluation task panicked".to_string(),
-                    None,
-                )),
-            },
-            _ = tokio::time::sleep(promote_after) => {
-                promote_to_background_job(result_rx, interrupt, jobs, root_job_sender, description)
             }
         }
+
+        for key in input_responses.keys() {
+            if Some(key) != consumed_id.as_ref() {
+                tracing::warn!(
+                    "ignoring inputResponses entry '{key}' with no matching elicitation"
+                );
+            }
+        }
+
+        self.drive_round(parked, &ctx.ct).await
+    }
+
+    /// Waits on the evaluation until it finishes, parks on an elicitation,
+    /// the request is cancelled, or the promote-after timer fires.
+    async fn drive_round(
+        &self,
+        mut parked: ParkedEval,
+        ct: &CancellationToken,
+    ) -> CallToolResponse {
+        loop {
+            match next_event(&mut parked, ct).await {
+                RoundEvent::Done(resolved) => match *resolved {
+                    Ok((new_state, result)) => {
+                        {
+                            let mut state = self.state.lock().await;
+                            *state = new_state;
+                        }
+                        return match result {
+                            Ok(output) => {
+                                CallToolResponse::Complete(output.into_call_tool_result())
+                            }
+                            Err(err) => CallToolResponse::Complete(error_call_tool_result(err)),
+                        };
+                    }
+                    Err(_) => {
+                        return CallToolResponse::Complete(error_call_tool_result(
+                            rmcp::ErrorData::internal_error(
+                                "Evaluation task panicked".to_string(),
+                                None,
+                            ),
+                        ));
+                    }
+                },
+                RoundEvent::Elicit(pending) => {
+                    let Some(token) = parked.token.clone() else {
+                        tracing::warn!(
+                            "dropping elicitation request: evaluation has no MRTR session token"
+                        );
+                        continue;
+                    };
+                    let mut input_requests = InputRequests::new();
+                    input_requests.insert(
+                        pending.id.clone(),
+                        InputRequest::Elicitation(pending.request),
+                    );
+                    parked.pending_answer = Some((pending.id.clone(), pending.answer_tx));
+                    self.park(token.clone(), parked);
+                    return CallToolResponse::InputRequired(InputRequiredResult::new(
+                        Some(input_requests),
+                        Some(token),
+                    ));
+                }
+                RoundEvent::Cancelled | RoundEvent::Promote => {
+                    // A parked evaluation waits on a human, not compute time:
+                    // keep it resumable via the same requestState token.
+                    if parked.parked.load(std::sync::atomic::Ordering::SeqCst)
+                        && let Some(token) = parked.token.clone()
+                    {
+                        self.park(token.clone(), parked);
+                        return CallToolResponse::Complete(error_call_tool_result(
+                            rmcp::ErrorData::internal_error(
+                                format!(
+                                    "request aborted while an elicitation was waiting for the user. \
+                                     The evaluation is still parked; retry `tools/call` for `evaluate` \
+                                     with the same input and requestState '{token}' to resume."
+                                ),
+                                None,
+                            ),
+                        ));
+                    }
+                    let outcome = promote_to_background_job(
+                        parked.result_rx,
+                        parked.interrupt,
+                        parked.jobs,
+                        parked.root_job_sender,
+                        parked.description,
+                    );
+                    return match outcome {
+                        Ok(output) => CallToolResponse::Complete(output.into_call_tool_result()),
+                        Err(err) => CallToolResponse::Complete(error_call_tool_result(err)),
+                    };
+                }
+            }
+        }
+    }
+
+    fn park(&self, token: String, parked: ParkedEval) {
+        let mut pending = lock_pending(&self.pending);
+        // Only one parked elicitation is kept at a time: a fresh park means the
+        // client moved on without answering an earlier round (the spec expects
+        // clients to settle pending input rounds before issuing new calls).
+        // Dropping the stale entry disconnects its answer channel so the
+        // parked builtin wakes with an error instead of holding a thread and a
+        // forked `EvalState` forever. Waiting on the *current* round never has
+        // a timeout — human response time is unbounded by design.
+        pending.retain(|other, _| *other == token);
+        pending.insert(token, parked);
     }
 
     /// Synchronous evaluation without cancellation support.
@@ -361,8 +658,25 @@ impl Evaluator {
                 None,
             )
         })?;
-        rt.block_on(self.eval_async_output(nu_source, CancellationToken::new()))
-            .map(|output| output.response)
+        let result = rt.block_on(self.eval_async(nu_source, CancellationToken::new()));
+        let text = result
+            .content
+            .iter()
+            .filter_map(ContentBlock::as_text)
+            .map(|text| text.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if result.is_error == Some(true) {
+            return Err(rmcp::ErrorData::internal_error(
+                if text.is_empty() {
+                    "evaluation failed".to_string()
+                } else {
+                    text
+                },
+                result.structured_content,
+            ));
+        }
+        Ok(text)
     }
 
     pub async fn list_available_commands(&self, find: Option<String>) -> Result<String, String> {
@@ -413,6 +727,71 @@ impl Evaluator {
             .ok_or_else(|| format!("command `{}` not found", command_name))?;
 
         Ok(format_command_help(&signature))
+    }
+}
+
+/// Waits on the evaluation thread, the elicitation request channel, the
+/// request cancellation token, and the promote timer.
+///
+/// The promote timer never fires while the builtin is parked waiting on a
+/// human: wall-clock waiting is not compute time.
+async fn next_event(parked: &mut ParkedEval, ct: &CancellationToken) -> RoundEvent {
+    use std::sync::atomic::Ordering;
+
+    let parked_flag = parked.parked.clone();
+    loop {
+        let timer = tokio::time::sleep(parked.promote_after);
+        tokio::pin!(timer);
+        tokio::select! {
+            biased;
+            _ = ct.cancelled() => return RoundEvent::Cancelled,
+            result = &mut parked.result_rx => return RoundEvent::Done(Box::new(result)),
+            maybe_request = parked.request_rx.next(), if parked.requests_open => {
+                match maybe_request {
+                    Some(request) => return RoundEvent::Elicit(Box::new(request)),
+                    None => parked.requests_open = false,
+                }
+            }
+            _ = &mut timer => {
+                if parked_flag.load(Ordering::SeqCst) {
+                    continue;
+                }
+                return RoundEvent::Promote;
+            }
+        }
+    }
+}
+
+fn lock_pending(
+    pending: &SyncMutex<HashMap<String, ParkedEval>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, ParkedEval>> {
+    pending
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn unknown_request_state_error(token: &str) -> CallToolResponse {
+    CallToolResponse::Complete(error_call_tool_result(rmcp::ErrorData::invalid_params(
+        format!(
+            "unknown or already-consumed requestState '{token}'; elicitation tokens are single-use and stop working once the answer is delivered, the parked round is superseded by a newer one, or the evaluation is promoted to a background job or its session closes"
+        ),
+        None,
+    )))
+}
+
+/// Registers the MCP-only `elicit` builtin on the evaluator engine.
+///
+/// The command exists only inside the MCP server's engine state, so normal
+/// interactive Nushell sessions never see it. Registration is idempotent
+/// because the HTTP transport creates one `Evaluator` per session.
+fn register_elicit_command(engine_state: &mut EngineState) {
+    let mut working_set = StateWorkingSet::new(engine_state);
+    if working_set.find_decl(b"elicit").is_none() {
+        working_set.add_decl(Box::new(crate::elicitation::Elicit));
+    }
+    let delta = working_set.render();
+    if let Err(err) = engine_state.merge_delta(delta) {
+        tracing::warn!("failed to register `elicit` command: {err}");
     }
 }
 

@@ -2,8 +2,11 @@ use crate::evaluation::Evaluator;
 use nu_protocol::{UseAnsiColoring, engine::EngineState};
 use rmcp::{
     RoleServer, ServerHandler,
-    handler::server::{tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig},
+    handler::server::{
+        tool::{InputResponses as InputResponsesPart, RequestState, ToolRouter},
+        wrapper::Parameters,
+    },
+    model::{CallToolResponse, Implementation, ServerCapabilities, ServerConfig},
     service::RequestContext,
     tool, tool_handler, tool_router,
 };
@@ -57,8 +60,12 @@ By default all available commands will be returned. To find a specific command b
         &self,
         ctx: RequestContext<RoleServer>,
         Parameters(NuSourceRequest { input }): Parameters<NuSourceRequest>,
-    ) -> CallToolResult {
-        self.evaluator.eval_async(&input, ctx.ct).await
+        RequestState(request_state): RequestState,
+        InputResponsesPart(input_responses): InputResponsesPart,
+    ) -> CallToolResponse {
+        self.evaluator
+            .eval_tool(&input, ctx, request_state, input_responses)
+            .await
     }
 }
 
@@ -98,9 +105,10 @@ mod tests {
     use super::*;
     use futures::channel::mpsc;
     use nu_cmd_lang::create_default_context;
-    use rmcp::model::RequestId;
+    use rmcp::model::{CallToolResult, RequestId};
     use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage, serve_directly};
     use serde_json::Value as JsonValue;
+    use tokio_util::sync::CancellationToken;
 
     fn make_request_context(request_id: i64) -> RequestContext<RoleServer> {
         let engine_state = create_default_context();
@@ -115,6 +123,15 @@ mod tests {
         drop(running);
 
         RequestContext::new(RequestId::Number(request_id), peer)
+    }
+
+    /// Unwraps a completed tool response; panics when an elicitation round
+    /// was expected but a plain result came back (or vice versa).
+    fn completed(response: CallToolResponse) -> CallToolResult {
+        match response {
+            CallToolResponse::Complete(result) => result,
+            other => panic!("expected a complete tool result, got {other:?}"),
+        }
     }
 
     #[test]
@@ -268,14 +285,18 @@ mod tests {
         let server = create_mcp_server();
         let ctx = make_request_context(1);
 
-        let result = server
-            .evaluate(
-                ctx,
-                Parameters(NuSourceRequest {
-                    input: "5 + 2".to_string(),
-                }),
-            )
-            .await;
+        let result = completed(
+            server
+                .evaluate(
+                    ctx,
+                    Parameters(NuSourceRequest {
+                        input: "5 + 2".to_string(),
+                    }),
+                    RequestState(None),
+                    InputResponsesPart(None),
+                )
+                .await,
+        );
         let text = result_text(&result);
 
         assert!(
@@ -302,28 +323,36 @@ mod tests {
         let engine_state = nu_cmd_lang::create_default_context();
         let server = NushellMcpServer::new(engine_state);
 
-        let result1 = server
-            .evaluate(
-                make_request_context(3),
-                Parameters(NuSourceRequest {
-                    input: "1".to_string(),
-                }),
-            )
-            .await;
+        let result1 = completed(
+            server
+                .evaluate(
+                    make_request_context(3),
+                    Parameters(NuSourceRequest {
+                        input: "1".to_string(),
+                    }),
+                    RequestState(None),
+                    InputResponsesPart(None),
+                )
+                .await,
+        );
         let result1 = result_text(&result1);
         assert!(
             result1.contains("history_index:0") || result1.contains("history_index: 0"),
             "first evaluation should have history_index 0"
         );
 
-        let result2 = server
-            .evaluate(
-                make_request_context(4),
-                Parameters(NuSourceRequest {
-                    input: "2".to_string(),
-                }),
-            )
-            .await;
+        let result2 = completed(
+            server
+                .evaluate(
+                    make_request_context(4),
+                    Parameters(NuSourceRequest {
+                        input: "2".to_string(),
+                    }),
+                    RequestState(None),
+                    InputResponsesPart(None),
+                )
+                .await,
+        );
         let result2 = result_text(&result2);
         assert!(
             result2.contains("history_index:1") || result2.contains("history_index: 1"),
@@ -353,6 +382,351 @@ mod tests {
         assert!(
             result.to_lowercase().contains("usage") || result.contains("Usage"),
             "command_help output should include usage information"
+        );
+    }
+
+    /// The MRTR round trip: `elicit` parks the evaluation and the first
+    /// `evaluate` call answers with `InputRequiredResult`; the retry with
+    /// matching `requestState` + `inputResponses` resumes the pipeline.
+    #[tokio::test]
+    async fn elicit_parks_evaluation_until_client_answers() {
+        use rmcp::model::{InputRequest, InputResponses};
+
+        let server = create_mcp_server();
+        let source = "let answer = elicit \"What is your name?\" --schema {name: string}; $\"hello ($answer.name)\"";
+
+        let first = server
+            .evaluate(
+                make_request_context(30),
+                Parameters(NuSourceRequest {
+                    input: source.to_string(),
+                }),
+                RequestState(None),
+                InputResponsesPart(None),
+            )
+            .await;
+        let CallToolResponse::InputRequired(input_required) = first else {
+            panic!("elicit should park into an InputRequiredResult, got {first:?}");
+        };
+        let token = input_required
+            .request_state
+            .expect("parked elicitation should carry a requestState token");
+        let requests = input_required
+            .input_requests
+            .expect("parked elicitation should carry inputRequests");
+        assert_eq!(requests.len(), 1, "one elicit call should park one request");
+        let (id, request) = requests.iter().next().expect("one request");
+        match request {
+            InputRequest::Elicitation(elicit) => {
+                let params = &elicit.params;
+                let rmcp::model::ElicitRequestParams::FormElicitationParams {
+                    message,
+                    requested_schema,
+                    ..
+                } = params
+                else {
+                    panic!("expected form-mode elicitation params");
+                };
+                assert_eq!(message, "What is your name?");
+                assert!(
+                    requested_schema.properties.contains_key("name"),
+                    "requested schema should expose the 'name' field"
+                );
+            }
+            other => panic!("expected an elicitation input request, got {other:?}"),
+        }
+
+        let mut responses = InputResponses::new();
+        responses.insert(
+            id.clone(),
+            serde_json::json!({ "action": "accept", "content": { "name": "Capitalist" } }),
+        );
+
+        let second = server
+            .evaluate(
+                make_request_context(31),
+                Parameters(NuSourceRequest {
+                    input: source.to_string(),
+                }),
+                RequestState(Some(token)),
+                InputResponsesPart(Some(responses)),
+            )
+            .await;
+        let result = completed(second);
+        let text = result_text(&result);
+        assert!(
+            text.contains("hello Capitalist"),
+            "resumed pipeline should emit the elicited answer, got: {text}"
+        );
+    }
+
+    /// A declined elicitation aborts the evaluated pipeline with an error.
+    #[tokio::test]
+    async fn elicit_decline_aborts_pipeline() {
+        use rmcp::model::InputResponses;
+
+        let server = create_mcp_server();
+        let source =
+            "elicit \"Delete the database?\" --schema {confirmed: bool}; \"should not get here\"";
+
+        let first = server
+            .evaluate(
+                make_request_context(32),
+                Parameters(NuSourceRequest {
+                    input: source.to_string(),
+                }),
+                RequestState(None),
+                InputResponsesPart(None),
+            )
+            .await;
+        let CallToolResponse::InputRequired(input_required) = first else {
+            panic!("expected an InputRequiredResult, got {first:?}");
+        };
+        let token = input_required
+            .request_state
+            .expect("requestState should be present");
+        let requests = input_required
+            .input_requests
+            .expect("inputRequests should be present");
+        let id = requests
+            .keys()
+            .next()
+            .cloned()
+            .expect("one elicitation request");
+
+        let mut responses = InputResponses::new();
+        responses.insert(id, serde_json::json!({ "action": "decline" }));
+
+        let second = server
+            .evaluate(
+                make_request_context(33),
+                Parameters(NuSourceRequest {
+                    input: source.to_string(),
+                }),
+                RequestState(Some(token.clone())),
+                InputResponsesPart(Some(responses)),
+            )
+            .await;
+        let result = completed(second);
+        assert_eq!(result.is_error, Some(true), "decline should error");
+        let text = result_text(&result);
+        assert!(
+            text.contains("declined"),
+            "error should mention the decline, got: {text}"
+        );
+    }
+
+    /// A second `elicit` in the same pipeline produces a second round under
+    /// the same `requestState` token.
+    #[tokio::test]
+    async fn elicit_supports_consecutive_rounds() {
+        use rmcp::model::InputResponses;
+
+        let server = create_mcp_server();
+        let source = "let a = elicit \"first\" --schema {x: string}; let b = elicit \"second\" --schema {y: string}; $\"($a.x)-($b.y)\"";
+
+        let first = server
+            .evaluate(
+                make_request_context(34),
+                Parameters(NuSourceRequest {
+                    input: source.to_string(),
+                }),
+                RequestState(None),
+                InputResponsesPart(None),
+            )
+            .await;
+        let CallToolResponse::InputRequired(round1) = first else {
+            panic!("expected an InputRequiredResult, got {first:?}");
+        };
+        let token = round1.request_state.clone().expect("requestState");
+        let id1 = round1
+            .input_requests
+            .expect("inputRequests")
+            .keys()
+            .next()
+            .cloned()
+            .expect("one request");
+
+        let mut responses1 = InputResponses::new();
+        responses1.insert(
+            id1,
+            serde_json::json!({ "action": "accept", "content": { "x": "ping" } }),
+        );
+
+        let second = server
+            .evaluate(
+                make_request_context(35),
+                Parameters(NuSourceRequest {
+                    input: source.to_string(),
+                }),
+                RequestState(Some(token.clone())),
+                InputResponsesPart(Some(responses1)),
+            )
+            .await;
+        let CallToolResponse::InputRequired(round2) = second else {
+            panic!("second elicit should park again, got {second:?}");
+        };
+        assert_eq!(
+            round2.request_state.as_deref(),
+            Some(token.as_str()),
+            "the same evaluation should keep its requestState token"
+        );
+        let id2 = round2
+            .input_requests
+            .expect("inputRequests")
+            .keys()
+            .next()
+            .cloned()
+            .expect("one request");
+
+        let mut responses2 = InputResponses::new();
+        responses2.insert(
+            id2,
+            serde_json::json!({ "action": "accept", "content": { "y": "pong" } }),
+        );
+
+        let third = server
+            .evaluate(
+                make_request_context(36),
+                Parameters(NuSourceRequest {
+                    input: source.to_string(),
+                }),
+                RequestState(Some(token)),
+                InputResponsesPart(Some(responses2)),
+            )
+            .await;
+        let result = completed(third);
+        let text = result_text(&result);
+        assert!(
+            text.contains("ping-pong"),
+            "pipeline should finish with both answers, got: {text}"
+        );
+    }
+
+    /// Retrying with an unknown or already-consumed token is a clean error.
+    #[tokio::test]
+    async fn resume_with_unknown_request_state_errors() {
+        let server = create_mcp_server();
+        let result = completed(
+            server
+                .evaluate(
+                    make_request_context(37),
+                    Parameters(NuSourceRequest {
+                        input: "'unreachable'".to_string(),
+                    }),
+                    RequestState(Some("not-a-real-token".to_string())),
+                    InputResponsesPart(None),
+                )
+                .await,
+        );
+        assert_eq!(result.is_error, Some(true), "unknown token should error");
+        let text = result_text(&result);
+        assert!(
+            text.contains("requestState"),
+            "error should explain the requestState problem, got: {text}"
+        );
+    }
+
+    /// Only one elicitation round stays parked at a time: when a newer
+    /// evaluation parks, a previously abandoned `requestState` stops working.
+    /// Waiting itself has no timeout.
+    #[tokio::test]
+    async fn newer_park_supersedes_abandoned_request_state() {
+        let server = create_mcp_server();
+
+        let response = server
+            .evaluator
+            .eval_tool(
+                "elicit \"abandoned prompt\"",
+                make_request_context(380),
+                None,
+                None,
+            )
+            .await;
+        let CallToolResponse::InputRequired(round1) = response else {
+            panic!("first elicit should park, got {response:?}");
+        };
+        let stale_token = round1.request_state.expect("requestState token");
+
+        // A second evaluation parks too, superseding the abandoned round.
+        let response2 = server
+            .evaluator
+            .eval_tool(
+                "elicit \"new prompt\"",
+                make_request_context(381),
+                None,
+                None,
+            )
+            .await;
+        let CallToolResponse::InputRequired(round2) = response2 else {
+            panic!("second elicit should park, got {response2:?}");
+        };
+        let fresh_token = round2.request_state.expect("requestState token");
+        assert_ne!(stale_token, fresh_token, "rounds get distinct tokens");
+
+        // The stale token is now unknown.
+        let resume = server
+            .evaluator
+            .eval_tool(
+                "elicit \"abandoned prompt\"",
+                make_request_context(382),
+                Some(stale_token),
+                None,
+            )
+            .await;
+        let result = completed(resume);
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "stale token should be rejected"
+        );
+        assert!(
+            result_text(&result).contains("requestState"),
+            "error should explain the superseded token"
+        );
+
+        // The fresh round still resumes normally.
+        let requests = round2
+            .input_requests
+            .expect("fresh round should carry its request");
+        let rid = requests.keys().next().cloned().expect("one request id");
+        let mut responses = rmcp::model::InputResponses::new();
+        responses.insert(rid, serde_json::json!({ "action": "accept" }));
+        let done = server
+            .evaluator
+            .eval_tool(
+                "elicit \"new prompt\"",
+                make_request_context(383),
+                Some(fresh_token),
+                Some(responses),
+            )
+            .await;
+        let result = completed(done);
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "fresh round should complete: {}",
+            result_text(&result)
+        );
+    }
+
+    /// `elicit` has no meaning outside a live MCP evaluation round.
+    #[tokio::test]
+    async fn elicit_without_active_mcp_request_errors() {
+        let server = create_mcp_server();
+        let result = server
+            .evaluator
+            .eval_async("elicit \"anywhere\"", CancellationToken::new())
+            .await;
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "elicit outside eval_tool should error"
+        );
+        let text = result_text(&result);
+        assert!(
+            text.contains("only run inside a live MCP"),
+            "error should explain the missing MCP context, got: {text}"
         );
     }
 }
