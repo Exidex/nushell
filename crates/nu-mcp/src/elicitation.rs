@@ -8,18 +8,19 @@
 //! `inputResponses` plus the echoed `requestState`.
 //!
 //! Because a running Nushell pipeline cannot be serialized/resumed, the
-//! evaluation thread simply stays parked inside [`Elicit::run`] between the two
-//! MCP rounds. The parked interpreter is bridged to the async tool handler via
-//! the [`ElicitBridge`] installed for each evaluation (see
+//! evaluation thread simply stays parked inside [`AskCommandPermission::run`]
+//! between the two MCP rounds. The parked interpreter is bridged to the async
+//! tool handler via the [`ElicitBridge`] installed for each evaluation (see
 //! [`with_active_bridge`]):
 //!
-//! 1. `elicit` sends a [`PendingElicit`] over `request_tx` and blocks on
-//!    `answer_rx.recv()`.
+//! 1. `ask_command_permission` sends a [`PendingElicit`] over `request_tx` and
+//!    blocks on `answer_rx.recv()`.
 //! 2. The handler observes the request, parks the evaluation under an opaque
 //!    `requestState` token, and answers the round with an `InputRequiredResult`.
 //! 3. The client prompts the user and retries `tools/call` with `inputResponses`.
-//! 4. The handler looks the token up, delivers the [`ElicitResult`] to the parked
-//!    `elicit` call, and the pipeline resumes as if nothing happened.
+//! 4. The handler looks the token up, delivers the [`ElicitResult`] to the
+//!    parked `ask_command_permission` call, and the pipeline resumes as if
+//!    nothing happened.
 //!
 //! Waiting on a human is unbounded by design: there is no elicitation timeout.
 //! The parked builtin still wakes cleanly (instead of hanging forever) because
@@ -33,16 +34,15 @@ use std::sync::mpsc::{self as sync_mpsc, RecvError};
 
 use nu_engine::CallExt;
 use nu_protocol::{
-    Category, Example, FromValue, IntoValue, PipelineData, ShellError, Signature, Span,
-    SyntaxShape, Type, Value,
+    Category, Example, PipelineData, ShellError, Signature, Span, SyntaxShape, Type, Value,
     engine::{Call, Command, EngineState, Stack},
     shell_error::generic::GenericError,
 };
 use rmcp::model::{
     ElicitRequest, ElicitRequestParams, ElicitResult, ElicitationAction, ElicitationSchema,
-    EnumSchema, PrimitiveSchemaDefinition, StringFormat,
+    MetaObject, RequestMetaObject,
 };
-use serde_json::{Map as JsonMap, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
 /// A single elicitation request parked inside a running evaluation, together
 /// with the channel its answer is delivered on.
@@ -52,11 +52,13 @@ pub(crate) struct PendingElicit {
     pub(crate) id: String,
     /// The `elicitation/create` request to surface to the client.
     pub(crate) request: ElicitRequest,
-    /// One-shot answer channel back into the blocked `elicit` command.
+    /// One-shot answer channel back into the blocked
+    /// `ask_command_permission` command.
     pub(crate) answer_tx: sync_mpsc::Sender<ElicitResult>,
 }
 
-/// Per-evaluation bridge that gives the synchronous `elicit` builtin access to
+/// Per-evaluation bridge that gives the synchronous `ask_command_permission`
+/// builtin access to
 /// the asynchronous MCP request round-trip. Cloned into a thread-local by
 /// [`with_active_bridge`] before evaluation starts.
 #[derive(Clone)]
@@ -101,41 +103,30 @@ fn bridge_error(
     ShellError::Generic(GenericError::new(error, msg, span))
 }
 
-/// Converts a `serde_json` value into a Nushell `Value`.
-fn json_to_nu_value(value: JsonValue, span: Span) -> Result<Value, ShellError> {
-    let text = serde_json::to_string(&value).map_err(|err| {
-        bridge_error(
-            "invalid elicitation response",
-            format!("could not encode the elicitation content: {err}"),
-            span,
-        )
-    })?;
-    let parsed: nu_json::Value = nu_json::from_str(&text).map_err(|err| {
-        bridge_error(
-            "invalid elicitation response",
-            format!("could not decode the elicitation content: {err}"),
-            span,
-        )
-    })?;
-    Ok(parsed.into_value(span))
+/// `_meta` marker key that flags an elicitation as a command-execution
+/// confirmation, letting clients render it distinctly. Arbitrary extension
+/// keys in `_meta` are allowed by SEP-1319.
+pub(crate) const COMMAND_EXECUTION_META_KEY: &str = "exidex/command_execution";
+
+/// Builds the request `_meta` carrying [`COMMAND_EXECUTION_META_KEY`] with the
+/// argv of the command the user is being asked to approve. The elicitation
+/// itself stays a pure confirmation dialog: an empty schema, no title.
+fn command_execution_meta(argv: Vec<String>) -> RequestMetaObject {
+    let mut meta = MetaObject::new();
+    meta.insert(
+        COMMAND_EXECUTION_META_KEY.to_string(),
+        JsonValue::Array(argv.into_iter().map(JsonValue::String).collect()),
+    );
+    RequestMetaObject(meta)
 }
 
 /// Maps the client's [`ElicitResult`] onto the Nushell pipeline: `accept`
-/// yields the content record, while `decline`/`cancel` abort the pipeline with
-/// a `ShellError`.
+/// yields `true`, `decline` yields `false`, while `cancel` aborts the pipeline
+/// with a `ShellError`.
 fn elicit_result_to_value(result: ElicitResult, span: Span) -> Result<Value, ShellError> {
     match result.action {
-        ElicitationAction::Accept => {
-            let content = result
-                .content
-                .unwrap_or_else(|| JsonValue::Object(JsonMap::new()));
-            json_to_nu_value(content, span)
-        }
-        ElicitationAction::Decline => Err(bridge_error(
-            "elicitation declined",
-            "the user declined the elicitation request",
-            span,
-        )),
+        ElicitationAction::Accept => Ok(Value::bool(true, span)),
+        ElicitationAction::Decline => Ok(Value::bool(false, span)),
         ElicitationAction::Cancel => Err(bridge_error(
             "elicitation cancelled",
             "the user cancelled the operation through the elicitation request",
@@ -149,186 +140,33 @@ fn elicit_result_to_value(result: ElicitResult, span: Span) -> Result<Value, She
     }
 }
 
-/// Builds an [`ElicitationSchema`] from the `--schema` record. Each entry maps
-/// a field name to one of:
+/// `ask_command_permission <args: list<string>>`
 ///
-/// * a primitive type name (`"string"`, `"int"`, `"number"`, `"bool"`,
-///   `"email"`, `"uri"`, `"date"`, `"datetime"`),
-/// * a list of choices (single-select enum), or
-/// * a record holding a raw JSON Schema fragment for advanced constraints.
-///
-/// Every field is required: elicitation forms show all declared fields anyway,
-/// and optional semantics add little value inside a tool call. Without
-/// `--schema`, an empty object schema turns the prompt into a pure
-/// confirmation dialog.
-fn build_requested_schema(
-    schema: Option<Value>,
-    title: Option<String>,
-    span: Span,
-) -> Result<ElicitationSchema, ShellError> {
-    let mut builder = ElicitationSchema::builder();
-    if let Some(title) = title {
-        builder = builder.title(title);
-    }
-
-    let Some(schema) = schema else {
-        return builder
-            .build()
-            .map_err(|err| bridge_error("invalid elicitation schema", err.to_string(), span));
-    };
-
-    let Value::Record { val: record, .. } = &schema else {
-        return Err(bridge_error(
-            "invalid elicitation schema",
-            "the --schema value must be a record of field name to type",
-            schema.span(),
-        ));
-    };
-
-    for (name, spec) in record.iter() {
-        builder = match spec {
-            Value::String { val, .. } => match val.as_str() {
-                "string" | "str" => builder.required_string(name.clone()),
-                "email" => builder.required_email(name.clone()),
-                "int" | "integer" => builder.required_integer_property(name.clone(), |s| s),
-                "number" | "float" => builder.required_number_property(name.clone(), |s| s),
-                "bool" | "boolean" => builder.required_bool_property(name.clone(), |s| s),
-                "uri" | "url" => builder.required_string_property(name.clone(), |mut s| {
-                    s.format = Some(StringFormat::Uri);
-                    s
-                }),
-                "date" => builder.required_string_property(name.clone(), |mut s| {
-                    s.format = Some(StringFormat::Date);
-                    s
-                }),
-                "datetime" | "date-time" => {
-                    builder.required_string_property(name.clone(), |mut s| {
-                        s.format = Some(StringFormat::DateTime);
-                        s
-                    })
-                }
-                other => {
-                    return Err(bridge_error(
-                        "unknown elicitation field type",
-                        format!(
-                            "field '{name}' has type '{other}'; expected one of string, int, \
-                             number, bool, email, uri, date, datetime, a list of choices, or a \
-                             JSON Schema record"
-                        ),
-                        spec.span(),
-                    ));
-                }
-            },
-            Value::List { vals, .. } => {
-                let mut choices = Vec::with_capacity(vals.len());
-                for item in vals {
-                    let choice = item.coerce_str().map_err(|_| {
-                        bridge_error(
-                            "invalid elicitation enum",
-                            format!(
-                                "enum choices for field '{name}' must be strings, got {}",
-                                item.get_type()
-                            ),
-                            item.span(),
-                        )
-                    })?;
-                    choices.push(choice.into_owned());
-                }
-                if choices.is_empty() {
-                    return Err(bridge_error(
-                        "invalid elicitation enum",
-                        format!("field '{name}' has an empty list of choices"),
-                        spec.span(),
-                    ));
-                }
-                let enum_schema = EnumSchema::builder(choices).build();
-                builder.required_enum_schema(name.clone(), enum_schema)
-            }
-            Value::Record { .. } => {
-                // Advanced case: pass a raw JSON Schema fragment through.
-                let as_nu_json = nu_json::Value::from_value(spec.clone()).map_err(|err| {
-                    bridge_error(
-                        "invalid elicitation schema",
-                        format!("field '{name}' could not be converted to JSON: {err}"),
-                        spec.span(),
-                    )
-                })?;
-                let as_json = serde_json::to_value(as_nu_json).map_err(|err| {
-                    bridge_error(
-                        "invalid elicitation schema",
-                        format!("field '{name}' could not be serialized: {err}"),
-                        spec.span(),
-                    )
-                })?;
-                let definition: PrimitiveSchemaDefinition = serde_json::from_value(as_json)
-                    .map_err(|err| {
-                        bridge_error(
-                            "invalid elicitation schema",
-                            format!(
-                                "field '{name}' is not a valid elicitation primitive schema: {err}"
-                            ),
-                            spec.span(),
-                        )
-                    })?;
-                builder.required_property(name.clone(), definition)
-            }
-            other => {
-                return Err(bridge_error(
-                    "invalid elicitation schema",
-                    format!(
-                        "field '{name}' must be a type name string, a list of choices, or a \
-                         JSON Schema record, got {}",
-                        other.get_type()
-                    ),
-                    spec.span(),
-                ));
-            }
-        };
-    }
-
-    builder
-        .build()
-        .map_err(|err| bridge_error("invalid elicitation schema", err.to_string(), span))
-}
-
-/// `elicit <message> [--title <string>] [--schema <record>]`
-///
-/// Prompts the MCP client for structured user input and blocks the pipeline
-/// until the client answers (or the elicitation times out). Only available
-/// while the code is running inside a live MCP `evaluate` request.
+/// Asks the MCP client (and through it the user) for permission to run a
+/// single command, given as its argv, and blocks the pipeline until the client
+/// answers. Only available while the code is running inside a live MCP
+/// `evaluate` request.
 #[derive(Clone)]
-pub(crate) struct Elicit;
+pub(crate) struct AskCommandPermission;
 
-impl Command for Elicit {
+impl Command for AskCommandPermission {
     fn name(&self) -> &str {
-        "elicit"
+        "ask_command_permission"
     }
 
     fn signature(&self) -> Signature {
-        Signature::build("elicit")
-            .input_output_types(vec![(Type::Nothing, Type::record())])
+        Signature::build("ask_command_permission")
+            .input_output_types(vec![(Type::Nothing, Type::Bool)])
             .required(
-                "message",
-                SyntaxShape::String,
-                "Human-readable message explaining what input is needed",
-            )
-            .named(
-                "title",
-                SyntaxShape::String,
-                "Optional title displayed above the elicitation form",
-                None,
-            )
-            .named(
-                "schema",
-                SyntaxShape::record(),
-                "Record of field name to primitive type ('string', 'int', 'number', 'bool', 'email', 'uri', 'date', 'datetime'), a list of enum choices, or a raw JSON Schema record; omit for a pure confirm dialog",
-                None,
+                "args",
+                SyntaxShape::List(Box::new(SyntaxShape::String)),
+                "The argv of the command that would run once the user grants permission, starting with the program name",
             )
             .category(Category::Misc)
     }
 
     fn description(&self) -> &str {
-        "Ask the MCP client (and through it the user) for structured input during an evaluate call."
+        "Ask the MCP client (and through it the user) for permission to run a single command, given as its argv, during an evaluate call."
     }
 
     fn extra_description(&self) -> &str {
@@ -336,37 +174,17 @@ impl Command for Elicit {
 
 The evaluated pipeline pauses at this command while the client prompts the user, then resumes with the answer:
 
-* `accept` - the provided content record becomes the command's output
-* `decline` - raises an error and aborts the pipeline
+* `accept` - the command outputs `true`
+* `decline` - the command outputs `false`, so the pipeline can branch instead of aborting
 * `cancel` - raises an error and aborts the pipeline
 
+The command argv is sent to the client under the `_meta` marker key
+`exidex/command_execution` so a supporting client can render a dedicated
+permission dialog; clients without that support just see the generated
+confirmation message. The elicitation form itself is a pure confirmation
+dialog (empty schema).
+
 This command is not registered in interactive Nushell sessions."
-    }
-
-    fn search_terms(&self) -> Vec<&str> {
-        vec![
-            "mcp",
-            "elicitation",
-            "prompt",
-            "user input",
-            "confirm",
-            "ask",
-        ]
-    }
-
-    fn examples(&self) -> Vec<Example<'_>> {
-        vec![
-            Example {
-                description: "Ask a yes/no confirmation; declining aborts the pipeline",
-                example: "elicit \"Delete this file? This cannot be undone.\" --schema {confirmed: bool}",
-                result: None,
-            },
-            Example {
-                description: "Collect a small form of named values",
-                example: "let form = elicit \"Project details\" --schema {name: string, stars: int, license: ['MIT', 'Apache-2.0']}",
-                result: None,
-            },
-        ]
     }
 
     fn run(
@@ -377,13 +195,25 @@ This command is not registered in interactive Nushell sessions."
         _input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let span = call.head;
-        let message: String = call.req(engine_state, stack, 0)?;
-        let title: Option<String> = call.get_flag(engine_state, stack, "title")?;
-        let schema: Option<Value> = call.get_flag(engine_state, stack, "schema")?;
+        let args: Vec<String> = call.req(engine_state, stack, 0)?;
 
-        let requested_schema = build_requested_schema(schema, title, span)?;
+        // The human-facing message is generated from the argv; the
+        // machine-readable payload travels in `_meta` under the marker key.
+        let message = if args.is_empty() {
+            "Allow Nushell to run the pending command?".to_string()
+        } else {
+            format!(
+                "Allow Nushell to run the following command?\n\n{}",
+                args.join(" ")
+            )
+        };
+
+        // A pure confirmation dialog.
+        let requested_schema = ElicitationSchema::builder()
+            .build()
+            .map_err(|err| bridge_error("invalid elicitation schema", err.to_string(), span))?;
         let request = ElicitRequest::new(ElicitRequestParams::FormElicitationParams {
-            meta: None,
+            meta: Some(command_execution_meta(args)),
             message,
             requested_schema,
         });
@@ -392,8 +222,8 @@ This command is not registered in interactive Nushell sessions."
             .with(|slot| slot.borrow().clone())
             .ok_or_else(|| {
                 bridge_error(
-                    "elicit outside an MCP evaluation",
-                    "`elicit` can only run inside a live MCP `evaluate` request; outside the MCP server (for example in an interactive session or a background job) there is no client to prompt",
+                    "ask_command_permission outside an MCP evaluation",
+                    "`ask_command_permission` can only run inside a live MCP `evaluate` request; outside the MCP server (for example in an interactive session or a background job) there is no client to prompt",
                     span,
                 )
             })?;
@@ -448,5 +278,31 @@ This command is not registered in interactive Nushell sessions."
 
         let value = elicit_result_to_value(result, span)?;
         Ok(PipelineData::value(value, None))
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                description: "Ask permission before running a command; accepting yields true",
+                example: "if (ask_command_permission [\"rm\", \"-rf\", \"target\"]) { rm -rf target }",
+                result: None,
+            },
+            Example {
+                description: "Declining yields false, letting the pipeline branch instead of aborting",
+                example: "let ok = ask_command_permission [\"systemctl\", \"restart\", \"myapp\"]; if not $ok { \"skipped\" }",
+                result: None,
+            },
+        ]
+    }
+
+    fn search_terms(&self) -> Vec<&str> {
+        vec![
+            "mcp",
+            "elicitation",
+            "permission",
+            "approve",
+            "confirm",
+            "ask",
+        ]
     }
 }

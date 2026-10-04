@@ -254,16 +254,22 @@ Gotchas: there is no `job ls` (use `job list`). `job recv` reads only the
 current job's mailbox and takes no id. `job send` always takes a target id;
 the main thread is `0`.
 
-## Asking the user — `elicit`
+## Asking the user — `ask_command_permission`
 
-Inside `evaluate`, the builtin `elicit` prompts the end user through the MCP
-client and returns their answer as a record. Use it before irreversible or
-ambiguous actions instead of guessing:
+Inside `evaluate`, the builtin `ask_command_permission` asks the end user,
+through the MCP client, for permission to run a single command given as its
+argv (the program first, then each argument as its own list item). Use it
+before irreversible or ambiguous actions instead of guessing:
 
 ```nu
-let answer = elicit "Delete the production bucket?" --schema {confirmed: bool}
-# answer == {confirmed: true} when accepted; decline/cancel abort the pipeline
+let ok = ask_command_permission ["rm", "-rf", "production-bucket"]
+# ok == true when accepted; declining yields false, cancelling aborts the pipeline
+if $ok { rm -rf production-bucket }
 ```
+
+The argv is delivered to the client under the elicitation `_meta` key
+`exidex/command_execution` so supporting clients can render a dedicated
+permission dialog.
 
 See the `evaluate` tool description for how the `input_required` round-trip
 works (`inputResponses` + `requestState`). Requires a client on MCP protocol

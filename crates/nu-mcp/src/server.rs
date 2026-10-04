@@ -385,15 +385,15 @@ mod tests {
         );
     }
 
-    /// The MRTR round trip: `elicit` parks the evaluation and the first
+    /// The MRTR round trip: `ask_command_permission` parks the evaluation and the first
     /// `evaluate` call answers with `InputRequiredResult`; the retry with
     /// matching `requestState` + `inputResponses` resumes the pipeline.
     #[tokio::test]
-    async fn elicit_parks_evaluation_until_client_answers() {
+    async fn ask_command_permission_parks_evaluation_until_client_answers() {
         use rmcp::model::{InputRequest, InputResponses};
 
         let server = create_mcp_server();
-        let source = "let answer = elicit \"What is your name?\" --schema {name: string}; $\"hello ($answer.name)\"";
+        let source = "let ok = ask_command_permission [\"ls\", \"-l\"]; $\"confirmed: ($ok)\"";
 
         let first = server
             .evaluate(
@@ -406,7 +406,7 @@ mod tests {
             )
             .await;
         let CallToolResponse::InputRequired(input_required) = first else {
-            panic!("elicit should park into an InputRequiredResult, got {first:?}");
+            panic!("ask_command_permission should park into an InputRequiredResult, got {first:?}");
         };
         let token = input_required
             .request_state
@@ -414,33 +414,46 @@ mod tests {
         let requests = input_required
             .input_requests
             .expect("parked elicitation should carry inputRequests");
-        assert_eq!(requests.len(), 1, "one elicit call should park one request");
+        assert_eq!(
+            requests.len(),
+            1,
+            "one ask_command_permission call should park one request"
+        );
         let (id, request) = requests.iter().next().expect("one request");
         match request {
-            InputRequest::Elicitation(elicit) => {
-                let params = &elicit.params;
+            InputRequest::Elicitation(permission) => {
+                let params = &permission.params;
                 let rmcp::model::ElicitRequestParams::FormElicitationParams {
+                    meta,
                     message,
                     requested_schema,
-                    ..
                 } = params
                 else {
                     panic!("expected form-mode elicitation params");
                 };
-                assert_eq!(message, "What is your name?");
+                assert_eq!(
+                    message,
+                    "Allow Nushell to run the following command?\n\nls -l"
+                );
                 assert!(
-                    requested_schema.properties.contains_key("name"),
-                    "requested schema should expose the 'name' field"
+                    requested_schema.properties.is_empty(),
+                    "the confirmation dialog should carry an empty schema"
+                );
+                let marker = meta
+                    .as_ref()
+                    .and_then(|meta| meta.get(crate::elicitation::COMMAND_EXECUTION_META_KEY))
+                    .expect("elicitation should carry the command execution marker in _meta");
+                assert_eq!(
+                    marker,
+                    &serde_json::json!(["ls", "-l"]),
+                    "the marker should carry the argv of the command awaiting approval"
                 );
             }
             other => panic!("expected an elicitation input request, got {other:?}"),
         }
 
         let mut responses = InputResponses::new();
-        responses.insert(
-            id.clone(),
-            serde_json::json!({ "action": "accept", "content": { "name": "Capitalist" } }),
-        );
+        responses.insert(id.clone(), serde_json::json!({ "action": "accept" }));
 
         let second = server
             .evaluate(
@@ -455,19 +468,18 @@ mod tests {
         let result = completed(second);
         let text = result_text(&result);
         assert!(
-            text.contains("hello Capitalist"),
-            "resumed pipeline should emit the elicited answer, got: {text}"
+            text.contains("confirmed: true"),
+            "resumed pipeline should see the accepted confirmation, got: {text}"
         );
     }
 
-    /// A declined elicitation aborts the evaluated pipeline with an error.
+    /// A declined elicitation yields `false` and the pipeline keeps running.
     #[tokio::test]
-    async fn elicit_decline_aborts_pipeline() {
+    async fn ask_command_permission_decline_yields_false() {
         use rmcp::model::InputResponses;
 
         let server = create_mcp_server();
-        let source =
-            "elicit \"Delete the database?\" --schema {confirmed: bool}; \"should not get here\"";
+        let source = "let ok = ask_command_permission [\"rm\", \"-rf\", \"backup\"]; $\"declined: (($ok) == false)\"";
 
         let first = server
             .evaluate(
@@ -508,22 +520,83 @@ mod tests {
             )
             .await;
         let result = completed(second);
-        assert_eq!(result.is_error, Some(true), "decline should error");
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "decline should not abort the pipeline: {}",
+            result_text(&result)
+        );
         let text = result_text(&result);
         assert!(
-            text.contains("declined"),
-            "error should mention the decline, got: {text}"
+            text.contains("declined: true"),
+            "decline should yield false so the pipeline can branch, got: {text}"
         );
     }
 
-    /// A second `elicit` in the same pipeline produces a second round under
-    /// the same `requestState` token.
+    /// A cancelled elicitation aborts the evaluated pipeline with an error.
     #[tokio::test]
-    async fn elicit_supports_consecutive_rounds() {
+    async fn ask_command_permission_cancel_aborts_pipeline() {
         use rmcp::model::InputResponses;
 
         let server = create_mcp_server();
-        let source = "let a = elicit \"first\" --schema {x: string}; let b = elicit \"second\" --schema {y: string}; $\"($a.x)-($b.y)\"";
+        let source =
+            "ask_command_permission [\"rm\", \"-rf\", \"backup\"]; \"should not get here\"";
+
+        let first = server
+            .evaluate(
+                make_request_context(40),
+                Parameters(NuSourceRequest {
+                    input: source.to_string(),
+                }),
+                RequestState(None),
+                InputResponsesPart(None),
+            )
+            .await;
+        let CallToolResponse::InputRequired(input_required) = first else {
+            panic!("expected an InputRequiredResult, got {first:?}");
+        };
+        let token = input_required
+            .request_state
+            .expect("requestState should be present");
+        let requests = input_required
+            .input_requests
+            .expect("inputRequests should be present");
+        let id = requests
+            .keys()
+            .next()
+            .cloned()
+            .expect("one elicitation request");
+
+        let mut responses = InputResponses::new();
+        responses.insert(id, serde_json::json!({ "action": "cancel" }));
+
+        let second = server
+            .evaluate(
+                make_request_context(41),
+                Parameters(NuSourceRequest {
+                    input: source.to_string(),
+                }),
+                RequestState(Some(token.clone())),
+                InputResponsesPart(Some(responses)),
+            )
+            .await;
+        let result = completed(second);
+        assert_eq!(result.is_error, Some(true), "cancel should error");
+        let text = result_text(&result);
+        assert!(
+            text.contains("cancelled"),
+            "error should mention the cancellation, got: {text}"
+        );
+    }
+
+    /// A second `ask_command_permission` in the same pipeline produces a second round under
+    /// the same `requestState` token.
+    #[tokio::test]
+    async fn ask_command_permission_supports_consecutive_rounds() {
+        use rmcp::model::InputResponses;
+
+        let server = create_mcp_server();
+        let source = "let a = ask_command_permission [\"first\"]; let b = ask_command_permission [\"second\"]; $\"($a)-($b)\"";
 
         let first = server
             .evaluate(
@@ -548,10 +621,7 @@ mod tests {
             .expect("one request");
 
         let mut responses1 = InputResponses::new();
-        responses1.insert(
-            id1,
-            serde_json::json!({ "action": "accept", "content": { "x": "ping" } }),
-        );
+        responses1.insert(id1, serde_json::json!({ "action": "accept" }));
 
         let second = server
             .evaluate(
@@ -564,7 +634,7 @@ mod tests {
             )
             .await;
         let CallToolResponse::InputRequired(round2) = second else {
-            panic!("second elicit should park again, got {second:?}");
+            panic!("second ask_command_permission should park again, got {second:?}");
         };
         assert_eq!(
             round2.request_state.as_deref(),
@@ -580,10 +650,7 @@ mod tests {
             .expect("one request");
 
         let mut responses2 = InputResponses::new();
-        responses2.insert(
-            id2,
-            serde_json::json!({ "action": "accept", "content": { "y": "pong" } }),
-        );
+        responses2.insert(id2, serde_json::json!({ "action": "decline" }));
 
         let third = server
             .evaluate(
@@ -598,8 +665,8 @@ mod tests {
         let result = completed(third);
         let text = result_text(&result);
         assert!(
-            text.contains("ping-pong"),
-            "pipeline should finish with both answers, got: {text}"
+            text.contains("true-false"),
+            "pipeline should finish with both permission answers, got: {text}"
         );
     }
 
@@ -637,14 +704,14 @@ mod tests {
         let response = server
             .evaluator
             .eval_tool(
-                "elicit \"abandoned prompt\"",
+                "ask_command_permission [\"abandoned\"]",
                 make_request_context(380),
                 None,
                 None,
             )
             .await;
         let CallToolResponse::InputRequired(round1) = response else {
-            panic!("first elicit should park, got {response:?}");
+            panic!("first ask_command_permission should park, got {response:?}");
         };
         let stale_token = round1.request_state.expect("requestState token");
 
@@ -652,14 +719,14 @@ mod tests {
         let response2 = server
             .evaluator
             .eval_tool(
-                "elicit \"new prompt\"",
+                "ask_command_permission [\"new\"]",
                 make_request_context(381),
                 None,
                 None,
             )
             .await;
         let CallToolResponse::InputRequired(round2) = response2 else {
-            panic!("second elicit should park, got {response2:?}");
+            panic!("second ask_command_permission should park, got {response2:?}");
         };
         let fresh_token = round2.request_state.expect("requestState token");
         assert_ne!(stale_token, fresh_token, "rounds get distinct tokens");
@@ -668,7 +735,7 @@ mod tests {
         let resume = server
             .evaluator
             .eval_tool(
-                "elicit \"abandoned prompt\"",
+                "ask_command_permission [\"abandoned\"]",
                 make_request_context(382),
                 Some(stale_token),
                 None,
@@ -695,7 +762,7 @@ mod tests {
         let done = server
             .evaluator
             .eval_tool(
-                "elicit \"new prompt\"",
+                "ask_command_permission [\"new\"]",
                 make_request_context(383),
                 Some(fresh_token),
                 Some(responses),
@@ -710,18 +777,21 @@ mod tests {
         );
     }
 
-    /// `elicit` has no meaning outside a live MCP evaluation round.
+    /// `ask_command_permission` has no meaning outside a live MCP evaluation round.
     #[tokio::test]
-    async fn elicit_without_active_mcp_request_errors() {
+    async fn ask_command_permission_without_active_mcp_request_errors() {
         let server = create_mcp_server();
         let result = server
             .evaluator
-            .eval_async("elicit \"anywhere\"", CancellationToken::new())
+            .eval_async(
+                "ask_command_permission [\"anywhere\"]",
+                CancellationToken::new(),
+            )
             .await;
         assert_eq!(
             result.is_error,
             Some(true),
-            "elicit outside eval_tool should error"
+            "ask_command_permission outside eval_tool should error"
         );
         let text = result_text(&result);
         assert!(

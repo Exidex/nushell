@@ -4,33 +4,35 @@ including `cwd`, `history_index`, `timestamp`, and either `output` or `note`.
 When evaluation fails, the MCP tool response is marked as an error and the content
 contains a structured NUON error record.
 
-## Asking the user (elicitation)
+## Asking the user for permission (elicitation)
 
-The `elicit` builtin prompts the end user for input through the MCP client and
-returns their answer as a record:
+The `ask_command_permission` builtin asks the end user, through the MCP client,
+for permission to run a single command given as its argv (the program first,
+then each argument as its own list item) and returns a bool:
 
 ```nu
-let form = elicit "Which region should the database use?" --schema {region: ["us-east", "eu-central"], confirm: bool}
+if (ask_command_permission ["rm", "-rf", "production-bucket"]) { rm -rf production-bucket }
 ```
 
-- `--schema <record>` maps field names to primitive types (`string`, `int`,
-  `number`, `bool`, `email`, `uri`, `date`, `datetime`), a list of enum
-  choices, or a raw JSON Schema record. Omit it for a pure confirm dialog.
-- Accept returns the content record. Decline or cancel abort the evaluated
-  pipeline with an error.
-- Elicitation uses the multi round-trip flow of MCP protocol `2026-07-28`: the
+- Accept returns `true`. Decline returns `false`, so the pipeline can branch
+  instead of aborting. Cancel aborts the evaluated pipeline with an error.
+- The argv is also delivered under the `_meta` key
+  `exidex/command_execution` so supporting clients can render a dedicated
+  permission dialog; other clients just see a generated confirmation message.
+- Permission requests use the multi round-trip flow of MCP protocol `2026-07-28`: the
   first call to this tool answers with an `input_required` result listing the
   pending prompts plus an opaque `requestState` token. Fulfill the prompts and
   retry this tool call with the same `input` plus `inputResponses` keyed by the
   prompt ids, and echo the `requestState`. The paused pipeline then resumes with
-  the user's answers, possibly parking again on further `elicit` calls.
+  the user's answer, possibly parking again on further
+  `ask_command_permission` calls.
 - There is no timeout on the user: the evaluation stays parked as long as the
   human needs, and resumes whenever the client retries. If the session closes
   before an answer arrives (or a newer elicitation round supersedes the parked
   one), the pipeline aborts with an error. Waiting on a human never triggers
   background promotion.
-- Clients on older protocol versions cannot be prompted; `elicit` then fails
-  with a clear error.
+- Clients on older protocol versions cannot be prompted; `ask_command_permission`
+  then fails with a clear error.
 
 Avoid commands that produce a large amount of output, and consider piping those outputs to files.
 If you need to run a long lived command, background it - e.g. `job spawn { uvicorn main:app }` so that
