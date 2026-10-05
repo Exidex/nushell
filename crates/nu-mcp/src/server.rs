@@ -385,15 +385,16 @@ mod tests {
         );
     }
 
-    /// The MRTR round trip: `ask_command_permission` parks the evaluation and the first
+    /// The MRTR round trip: `run-external-on-host` parks the evaluation and the first
     /// `evaluate` call answers with `InputRequiredResult`; the retry with
-    /// matching `requestState` + `inputResponses` resumes the pipeline.
+    /// matching `requestState` + `inputResponses` resumes the pipeline with the
+    /// host command's captured output.
     #[tokio::test]
-    async fn ask_command_permission_parks_evaluation_until_client_answers() {
+    async fn run_external_on_host_parks_evaluation_until_client_answers() {
         use rmcp::model::{InputRequest, InputResponses};
 
         let server = create_mcp_server();
-        let source = "let ok = ask_command_permission [\"ls\", \"-l\"]; $\"confirmed: ($ok)\"";
+        let source = "let out = run-external-on-host [\"ls\", \"-l\"] | collect; $\"got: ($out)\"";
 
         let first = server
             .evaluate(
@@ -406,7 +407,7 @@ mod tests {
             )
             .await;
         let CallToolResponse::InputRequired(input_required) = first else {
-            panic!("ask_command_permission should park into an InputRequiredResult, got {first:?}");
+            panic!("run-external-on-host should park into an InputRequiredResult, got {first:?}");
         };
         let token = input_required
             .request_state
@@ -417,7 +418,7 @@ mod tests {
         assert_eq!(
             requests.len(),
             1,
-            "one ask_command_permission call should park one request"
+            "one run-external-on-host call should park one request"
         );
         let (id, request) = requests.iter().next().expect("one request");
         match request {
@@ -433,11 +434,19 @@ mod tests {
                 };
                 assert_eq!(
                     message,
-                    "Allow Nushell to run the following command?\n\nls -l"
+                    "Allow Nushell to run the following command on the host?\n\nls -l"
                 );
+                assert_eq!(
+                    requested_schema.properties.len(),
+                    3,
+                    "the schema should declare the host execution result fields"
+                );
+                let required = requested_schema.required.clone().unwrap_or_default();
                 assert!(
-                    requested_schema.properties.is_empty(),
-                    "the confirmation dialog should carry an empty schema"
+                    required.contains(&"stdout_b64".to_string())
+                        && required.contains(&"stderr_b64".to_string())
+                        && required.contains(&"exit_code".to_string()),
+                    "all result fields should be required"
                 );
                 let marker = meta
                     .as_ref()
@@ -452,8 +461,20 @@ mod tests {
             other => panic!("expected an elicitation input request, got {other:?}"),
         }
 
+        // The client executed `ls -l` on the host and reports the result:
+        // "hello" and "!" base64-encoded, exit code 0.
         let mut responses = InputResponses::new();
-        responses.insert(id.clone(), serde_json::json!({ "action": "accept" }));
+        responses.insert(
+            id.clone(),
+            serde_json::json!({
+                "action": "accept",
+                "content": {
+                    "stdout_b64": "aGVsbG8=",
+                    "stderr_b64": "IQ==",
+                    "exit_code": 0
+                }
+            }),
+        );
 
         let second = server
             .evaluate(
@@ -468,18 +489,18 @@ mod tests {
         let result = completed(second);
         let text = result_text(&result);
         assert!(
-            text.contains("confirmed: true"),
-            "resumed pipeline should see the accepted confirmation, got: {text}"
+            text.contains("got: hello!"),
+            "resumed pipeline should see the merged host command output, got: {text}"
         );
     }
 
-    /// A declined elicitation yields `false` and the pipeline keeps running.
+    /// A declined host execution aborts the evaluated pipeline with an error.
     #[tokio::test]
-    async fn ask_command_permission_decline_yields_false() {
+    async fn run_external_on_host_decline_aborts_pipeline() {
         use rmcp::model::InputResponses;
 
         let server = create_mcp_server();
-        let source = "let ok = ask_command_permission [\"rm\", \"-rf\", \"backup\"]; $\"declined: (($ok) == false)\"";
+        let source = "run-external-on-host [\"rm\", \"-rf\", \"backup\"]; \"should not get here\"";
 
         let first = server
             .evaluate(
@@ -520,27 +541,81 @@ mod tests {
             )
             .await;
         let result = completed(second);
-        assert_ne!(
+        assert_eq!(result.is_error, Some(true), "decline should error");
+        let text = result_text(&result);
+        assert!(
+            text.contains("declined"),
+            "error should mention the decline, got: {text}"
+        );
+    }
+
+    /// An accept whose content lacks the required execution result fields is
+    /// an error, never a silently empty success.
+    #[tokio::test]
+    async fn run_external_on_host_accept_without_result_content_errors() {
+        use rmcp::model::InputResponses;
+
+        let server = create_mcp_server();
+        let source = "run-external-on-host [\"touch\"]";
+
+        let first = server
+            .evaluate(
+                make_request_context(42),
+                Parameters(NuSourceRequest {
+                    input: source.to_string(),
+                }),
+                RequestState(None),
+                InputResponsesPart(None),
+            )
+            .await;
+        let CallToolResponse::InputRequired(input_required) = first else {
+            panic!("expected an InputRequiredResult, got {first:?}");
+        };
+        let token = input_required
+            .request_state
+            .expect("requestState should be present");
+        let id = input_required
+            .input_requests
+            .expect("inputRequests")
+            .keys()
+            .next()
+            .cloned()
+            .expect("one elicitation request");
+
+        let mut responses = InputResponses::new();
+        responses.insert(id, serde_json::json!({ "action": "accept" }));
+
+        let second = server
+            .evaluate(
+                make_request_context(43),
+                Parameters(NuSourceRequest {
+                    input: source.to_string(),
+                }),
+                RequestState(Some(token)),
+                InputResponsesPart(Some(responses)),
+            )
+            .await;
+        let result = completed(second);
+        assert_eq!(
             result.is_error,
             Some(true),
-            "decline should not abort the pipeline: {}",
+            "an accept without result content must error, got: {}",
             result_text(&result)
         );
         let text = result_text(&result);
         assert!(
-            text.contains("declined: true"),
-            "decline should yield false so the pipeline can branch, got: {text}"
+            text.contains("missing") && text.contains("stdout_b64"),
+            "error should explain the missing result fields, got: {text}"
         );
     }
 
     /// A cancelled elicitation aborts the evaluated pipeline with an error.
     #[tokio::test]
-    async fn ask_command_permission_cancel_aborts_pipeline() {
+    async fn run_external_on_host_cancel_aborts_pipeline() {
         use rmcp::model::InputResponses;
 
         let server = create_mcp_server();
-        let source =
-            "ask_command_permission [\"rm\", \"-rf\", \"backup\"]; \"should not get here\"";
+        let source = "run-external-on-host [\"rm\", \"-rf\", \"backup\"]; \"should not get here\"";
 
         let first = server
             .evaluate(
@@ -589,14 +664,14 @@ mod tests {
         );
     }
 
-    /// A second `ask_command_permission` in the same pipeline produces a second round under
+    /// A second `run-external-on-host` in the same pipeline produces a second round under
     /// the same `requestState` token.
     #[tokio::test]
-    async fn ask_command_permission_supports_consecutive_rounds() {
+    async fn run_external_on_host_supports_consecutive_rounds() {
         use rmcp::model::InputResponses;
 
         let server = create_mcp_server();
-        let source = "let a = ask_command_permission [\"first\"]; let b = ask_command_permission [\"second\"]; $\"($a)-($b)\"";
+        let source = "let a = run-external-on-host [\"first\"] | collect; let b = run-external-on-host [\"second\"] | collect; $\"($a)-($b)\"";
 
         let first = server
             .evaluate(
@@ -621,7 +696,13 @@ mod tests {
             .expect("one request");
 
         let mut responses1 = InputResponses::new();
-        responses1.insert(id1, serde_json::json!({ "action": "accept" }));
+        responses1.insert(
+            id1,
+            serde_json::json!({
+                "action": "accept",
+                "content": { "stdout_b64": "QQ==", "stderr_b64": "", "exit_code": 0 }
+            }),
+        );
 
         let second = server
             .evaluate(
@@ -634,7 +715,7 @@ mod tests {
             )
             .await;
         let CallToolResponse::InputRequired(round2) = second else {
-            panic!("second ask_command_permission should park again, got {second:?}");
+            panic!("second run-external-on-host should park again, got {second:?}");
         };
         assert_eq!(
             round2.request_state.as_deref(),
@@ -650,7 +731,13 @@ mod tests {
             .expect("one request");
 
         let mut responses2 = InputResponses::new();
-        responses2.insert(id2, serde_json::json!({ "action": "decline" }));
+        responses2.insert(
+            id2,
+            serde_json::json!({
+                "action": "accept",
+                "content": { "stdout_b64": "Qg==", "stderr_b64": "", "exit_code": 3 }
+            }),
+        );
 
         let third = server
             .evaluate(
@@ -665,8 +752,8 @@ mod tests {
         let result = completed(third);
         let text = result_text(&result);
         assert!(
-            text.contains("true-false"),
-            "pipeline should finish with both permission answers, got: {text}"
+            text.contains("A-B"),
+            "pipeline should finish with both host command outputs, got: {text}"
         );
     }
 
@@ -704,14 +791,14 @@ mod tests {
         let response = server
             .evaluator
             .eval_tool(
-                "ask_command_permission [\"abandoned\"]",
+                "run-external-on-host [\"abandoned\"]",
                 make_request_context(380),
                 None,
                 None,
             )
             .await;
         let CallToolResponse::InputRequired(round1) = response else {
-            panic!("first ask_command_permission should park, got {response:?}");
+            panic!("first run-external-on-host should park, got {response:?}");
         };
         let stale_token = round1.request_state.expect("requestState token");
 
@@ -719,14 +806,14 @@ mod tests {
         let response2 = server
             .evaluator
             .eval_tool(
-                "ask_command_permission [\"new\"]",
+                "run-external-on-host [\"new\"]",
                 make_request_context(381),
                 None,
                 None,
             )
             .await;
         let CallToolResponse::InputRequired(round2) = response2 else {
-            panic!("second ask_command_permission should park, got {response2:?}");
+            panic!("second run-external-on-host should park, got {response2:?}");
         };
         let fresh_token = round2.request_state.expect("requestState token");
         assert_ne!(stale_token, fresh_token, "rounds get distinct tokens");
@@ -735,7 +822,7 @@ mod tests {
         let resume = server
             .evaluator
             .eval_tool(
-                "ask_command_permission [\"abandoned\"]",
+                "run-external-on-host [\"abandoned\"]",
                 make_request_context(382),
                 Some(stale_token),
                 None,
@@ -758,11 +845,17 @@ mod tests {
             .expect("fresh round should carry its request");
         let rid = requests.keys().next().cloned().expect("one request id");
         let mut responses = rmcp::model::InputResponses::new();
-        responses.insert(rid, serde_json::json!({ "action": "accept" }));
+        responses.insert(
+            rid,
+            serde_json::json!({
+                "action": "accept",
+                "content": { "stdout_b64": "", "stderr_b64": "", "exit_code": 0 }
+            }),
+        );
         let done = server
             .evaluator
             .eval_tool(
-                "ask_command_permission [\"new\"]",
+                "run-external-on-host [\"new\"]",
                 make_request_context(383),
                 Some(fresh_token),
                 Some(responses),
@@ -777,21 +870,21 @@ mod tests {
         );
     }
 
-    /// `ask_command_permission` has no meaning outside a live MCP evaluation round.
+    /// `run-external-on-host` has no meaning outside a live MCP evaluation round.
     #[tokio::test]
-    async fn ask_command_permission_without_active_mcp_request_errors() {
+    async fn run_external_on_host_without_active_mcp_request_errors() {
         let server = create_mcp_server();
         let result = server
             .evaluator
             .eval_async(
-                "ask_command_permission [\"anywhere\"]",
+                "run-external-on-host [\"anywhere\"]",
                 CancellationToken::new(),
             )
             .await;
         assert_eq!(
             result.is_error,
             Some(true),
-            "ask_command_permission outside eval_tool should error"
+            "run-external-on-host outside eval_tool should error"
         );
         let text = result_text(&result);
         assert!(

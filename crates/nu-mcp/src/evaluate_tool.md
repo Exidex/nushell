@@ -4,34 +4,44 @@ including `cwd`, `history_index`, `timestamp`, and either `output` or `note`.
 When evaluation fails, the MCP tool response is marked as an error and the content
 contains a structured NUON error record.
 
-## Asking the user for permission (elicitation)
+## Running commands on the host (elicitation)
 
-The `ask_command_permission` builtin asks the end user, through the MCP client,
-for permission to run a single command given as its argv (the program first,
-then each argument as its own list item) and returns a bool:
+The `run-external-on-host` builtin asks the end user, through the MCP client,
+to run a single command given as its argv (the program first, then each
+argument as its own list item) on the host machine, outside this sandboxed
+Nushell. The command's captured output emerges as a byte stream, transparently
+like a local external command:
 
 ```nu
-if (ask_command_permission ["rm", "-rf", "production-bucket"]) { rm -rf production-bucket }
+run-external-on-host ["git", "status"] | lines
 ```
 
-- Accept returns `true`. Decline returns `false`, so the pipeline can branch
-  instead of aborting. Cancel aborts the evaluated pipeline with an error.
+- Accept requires the client to execute the command and report the result in
+  the elicitation content: `stdout_b64`/`stderr_b64` (captured output bytes,
+  base64-encoded, RFC 4648 standard alphabet) and `exit_code`. The merged
+  stream (stdout, then stderr) continues the pipeline; a non-zero exit code
+  does not abort on its own (it is attached to the stream metadata under the
+  custom key `host_exit_code`, visible via `describe --detailed`).
+- Decline or cancel aborts the evaluated pipeline with an error.
 - The argv is also delivered under the `_meta` key
   `exidex/command_execution` so supporting clients can render a dedicated
-  permission dialog; other clients just see a generated confirmation message.
-- Permission requests use the multi round-trip flow of MCP protocol `2026-07-28`: the
+  approval dialog and know they must execute the argv themselves; clients
+  without that contract cannot fulfill the request (an accept without result
+  content is an error).
+- Host execution uses the multi round-trip flow of MCP protocol `2026-07-28`: the
   first call to this tool answers with an `input_required` result listing the
-  pending prompts plus an opaque `requestState` token. Fulfill the prompts and
-  retry this tool call with the same `input` plus `inputResponses` keyed by the
-  prompt ids, and echo the `requestState`. The paused pipeline then resumes with
-  the user's answer, possibly parking again on further
-  `ask_command_permission` calls.
-- There is no timeout on the user: the evaluation stays parked as long as the
-  human needs, and resumes whenever the client retries. If the session closes
-  before an answer arrives (or a newer elicitation round supersedes the parked
-  one), the pipeline aborts with an error. Waiting on a human never triggers
-  background promotion.
-- Clients on older protocol versions cannot be prompted; `ask_command_permission`
+  pending prompts plus an opaque `requestState` token. Prompt the user, run the
+  approved command, and retry this tool call with the same `input` plus
+  `inputResponses` keyed by the prompt ids (the accepted entry carrying the
+  result content), echoing the `requestState`. The paused pipeline then resumes
+  with the command output, possibly parking again on further
+  `run-external-on-host` calls.
+- There is no timeout on the user or on the host command: the evaluation stays
+  parked as long as needed, and resumes whenever the client retries. If the
+  session closes before an answer arrives (or a newer elicitation round
+  supersedes the parked one), the pipeline aborts with an error. Waiting on a
+  human never triggers background promotion.
+- Clients on older protocol versions cannot be prompted; `run-external-on-host`
   then fails with a clear error.
 
 Avoid commands that produce a large amount of output, and consider piping those outputs to files.

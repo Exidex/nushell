@@ -254,22 +254,26 @@ Gotchas: there is no `job ls` (use `job list`). `job recv` reads only the
 current job's mailbox and takes no id. `job send` always takes a target id;
 the main thread is `0`.
 
-## Asking the user — `ask_command_permission`
+## Running commands on the host — `run-external-on-host`
 
-Inside `evaluate`, the builtin `ask_command_permission` asks the end user,
-through the MCP client, for permission to run a single command given as its
-argv (the program first, then each argument as its own list item). Use it
-before irreversible or ambiguous actions instead of guessing:
+Inside `evaluate`, the builtin `run-external-on-host` asks the end user,
+through the MCP client, to run a single command given as its argv (the program
+first, then each argument as its own list item) on the host machine, outside
+this sandboxed Nushell. Use it when you genuinely need host execution:
 
 ```nu
-let ok = ask_command_permission ["rm", "-rf", "production-bucket"]
-# ok == true when accepted; declining yields false, cancelling aborts the pipeline
-if $ok { rm -rf production-bucket }
+run-external-on-host ["git", "status"] | lines
+# the accepted command's stdout (then stderr) flows through the pipeline
 ```
+
+Declining or cancelling aborts the pipeline; a non-zero exit code does not
+abort on its own (check the stream metadata key `host_exit_code` via
+`describe --detailed`).
 
 The argv is delivered to the client under the elicitation `_meta` key
 `exidex/command_execution` so supporting clients can render a dedicated
-permission dialog.
+approval dialog and know they must execute the command themselves, reporting
+`stdout_b64`, `stderr_b64` and `exit_code` in the accepted elicitation content.
 
 See the `evaluate` tool description for how the `input_required` round-trip
 works (`inputResponses` + `requestState`). Requires a client on MCP protocol

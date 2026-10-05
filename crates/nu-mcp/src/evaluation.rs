@@ -243,7 +243,7 @@ pub struct Evaluator {
 /// A live evaluation that has returned an `InputRequiredResult` and is waiting
 /// for the client to retry `tools/call` with `inputResponses`.
 ///
-/// The Nushell interpreter thread stays blocked inside the `ask_command_permission` command on
+/// The Nushell interpreter thread stays blocked inside the `run-external-on-host` command on
 /// `pending_answer`'s channel while the MCP round is over; delivering the
 /// answer resumes the pipeline as if nothing happened.
 struct ParkedEval {
@@ -257,7 +257,7 @@ struct ParkedEval {
     /// answer is delivered on. At most one elicitation can be outstanding per
     /// evaluation because the pipeline blocks on a single thread.
     pending_answer: Option<(String, mpsc::Sender<ElicitResult>)>,
-    /// Mirrors the flag the `ask_command_permission` builtin sets while waiting on the user.
+    /// Mirrors the flag the `run-external-on-host` builtin sets while waiting on the user.
     parked: Arc<AtomicBool>,
     interrupt: Arc<AtomicBool>,
     jobs: Arc<SyncMutex<Jobs>>,
@@ -268,14 +268,14 @@ struct ParkedEval {
 
 /// Elicitation capability of the client for a fresh evaluation round.
 enum BridgeMode {
-    /// No bridge at all: `ask_command_permission` fails with "outside an MCP evaluation".
+    /// No bridge at all: `run-external-on-host` fails with "outside an MCP evaluation".
     /// Used by the synchronous test path.
     #[cfg(test)]
     Disabled,
     /// The client negotiated a pre-`2026-07-28` protocol without MRTR
-    /// support; `ask_command_permission` fails with a clear version error.
+    /// support; `run-external-on-host` fails with a clear version error.
     Legacy { version: String },
-    /// MRTR elicitation is available; `ask_command_permission` can park the evaluation.
+    /// MRTR elicitation is available; `run-external-on-host` can park the evaluation.
     MrtrCapable,
 }
 
@@ -287,7 +287,7 @@ type EvalDone = Result<(EvalState, Result<EvalOutput, rmcp::ErrorData>), oneshot
 enum RoundEvent {
     /// The evaluation thread finished (`Err` variant = task panicked).
     Done(Box<EvalDone>),
-    /// A parked `ask_command_permission` builtin surfaced an elicitation request.
+    /// A parked `run-external-on-host` builtin surfaced an elicitation request.
     Elicit(Box<PendingElicit>),
     /// The current MCP request was cancelled.
     Cancelled,
@@ -343,7 +343,7 @@ impl Evaluator {
         config.use_ansi_coloring = nu_protocol::UseAnsiColoring::False;
         engine_state.set_config(config);
 
-        register_ask_command_permission(&mut engine_state);
+        register_run_external_on_host(&mut engine_state);
 
         let history = History::new(&mut engine_state);
 
@@ -363,7 +363,7 @@ impl Evaluator {
     /// elicitation flow from the `2026-07-28` spec revision.
     ///
     /// Fresh calls (`request_state == None`) start a new evaluation. When the
-    /// pipeline reaches the `ask_command_permission` builtin the evaluation thread parks and
+    /// pipeline reaches the `run-external-on-host` builtin the evaluation thread parks and
     /// this returns [`CallToolResponse::InputRequired`] carrying the
     /// `elicitation/create` request plus an opaque `requestState` token. The
     /// client then retries `evaluate` with `input_responses` and that token,
@@ -403,7 +403,7 @@ impl Evaluator {
 
     /// Evaluates Nushell source without elicitation support.
     ///
-    /// Test-only companion of [`Evaluator::eval_tool`]; `ask_command_permission` calls fail
+    /// Test-only companion of [`Evaluator::eval_tool`]; `run-external-on-host` calls fail
     /// with a clear error since no MCP round is attached.
     #[cfg(test)]
     pub async fn eval_async(&self, nu_source: &str, ct: CancellationToken) -> CallToolResult {
@@ -779,20 +779,20 @@ fn unknown_request_state_error(token: &str) -> CallToolResponse {
     )))
 }
 
-/// Registers the MCP-only `ask_command_permission` builtin on the evaluator
+/// Registers the MCP-only `run-external-on-host` builtin on the evaluator
 /// engine.
 ///
 /// The command exists only inside the MCP server's engine state, so normal
 /// interactive Nushell sessions never see it. Registration is idempotent
 /// because the HTTP transport creates one `Evaluator` per session.
-fn register_ask_command_permission(engine_state: &mut EngineState) {
+fn register_run_external_on_host(engine_state: &mut EngineState) {
     let mut working_set = StateWorkingSet::new(engine_state);
-    if working_set.find_decl(b"ask_command_permission").is_none() {
-        working_set.add_decl(Box::new(crate::elicitation::AskCommandPermission));
+    if working_set.find_decl(b"run-external-on-host").is_none() {
+        working_set.add_decl(Box::new(crate::elicitation::RunExternalOnHost));
     }
     let delta = working_set.render();
     if let Err(err) = engine_state.merge_delta(delta) {
-        tracing::warn!("failed to register `ask_command_permission` command: {err}");
+        tracing::warn!("failed to register `run-external-on-host` command: {err}");
     }
 }
 
