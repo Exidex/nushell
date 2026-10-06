@@ -131,6 +131,11 @@ const STDERR_B64_FIELD: &str = "stderr_b64";
 /// Elicitation content field carrying the command's exit code.
 const EXIT_CODE_FIELD: &str = "exit_code";
 
+/// Elicitation content field a client may use on a *decline* to say why the request was
+/// refused. A policy denial travels here: without it the model sees a bare "declined",
+/// learns nothing about what stopped it, and retries the same argv.
+const MESSAGE_FIELD: &str = "message";
+
 /// Key under which the host exit code is attached to the resulting stream's
 /// [`PipelineMetadata::custom`], following the namespaced-key convention of
 /// that field.
@@ -268,7 +273,9 @@ impl Command for RunExternalOnHost {
 The evaluated pipeline pauses at this command while the client prompts the user and, once approved, executes the command outside the sandbox. The command's output emerges as a byte stream, just like a local external command, so `| lines`, `| collect` and string interpolation all work on it. The result is handled as follows:
 
 * `accept` - the command must answer with the execution result in the elicitation content: `stdout_b64`/`stderr_b64` (captured output bytes, base64-encoded per RFC 4648 standard alphabet) and `exit_code`. stdout is reported first, then stderr, matching how a local external's merged capture reads.
-* `decline` - raises an error and aborts the pipeline: the command never ran.
+* `decline` - raises an error and aborts the pipeline: the command never ran. A client may explain
+  the refusal in the elicitation content under the key `message`; that text becomes the error
+  the caller sees, so a policy denial reads as a reason rather than a bare no.
 * `cancel` - raises an error and aborts the pipeline.
 
 A non-zero `exit_code` does not abort the pipeline on its own, mirroring how externals behave in this evaluator (its exit code is attached to the stream metadata under the custom key `host_exit_code` and visible via `describe --detailed`); branch on the output explicitly if a failure must stop the pipeline.
@@ -394,11 +401,23 @@ This command is not registered in interactive Nushell sessions."
                 );
                 Ok(PipelineData::byte_stream(stream, Some(metadata)))
             }
-            ElicitationAction::Decline => Err(bridge_error(
-                "host command execution declined",
-                "the user declined to run the command on the host, so the evaluation was interrupted",
-                span,
-            )),
+            ElicitationAction::Decline => {
+                let reason = result
+                    .content
+                    .as_ref()
+                    .and_then(|content| content.get(MESSAGE_FIELD))
+                    .and_then(JsonValue::as_str);
+                Err(match reason {
+                    // The client's own words become the error text: the pipeline aborts either
+                    // way, but a reason is what makes a refusal actionable instead of a retry.
+                    Some(text) => bridge_error("host command execution refused", text.to_string(), span),
+                    None => bridge_error(
+                        "host command execution declined",
+                        "the user declined to run the command on the host, so the evaluation was interrupted",
+                        span,
+                    ),
+                })
+            }
             ElicitationAction::Cancel => Err(bridge_error(
                 "elicitation cancelled",
                 "the user cancelled the operation through the elicitation request",
